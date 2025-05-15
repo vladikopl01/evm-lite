@@ -1,3 +1,6 @@
+use alloy_primitives::U256;
+
+use super::memory::Memory;
 use super::opcode::Opcode;
 use super::stack::Stack;
 
@@ -5,6 +8,7 @@ pub struct Evm {
     pub stack: Stack,
     pc: usize,
     code: Vec<u8>,
+    memory: Memory,
 }
 
 impl Evm {
@@ -13,6 +17,7 @@ impl Evm {
             code,
             pc: 0,
             stack: Stack::new(),
+            memory: Memory::new(),
         }
     }
 
@@ -31,18 +36,28 @@ impl Evm {
             Opcode::ADD => self.bin_op(|a, b| a + b),
             Opcode::MUL => self.bin_op(|a, b| a * b),
             Opcode::SUB => self.bin_op(|a, b| a - b),
+            Opcode::MLOAD => {
+                let offset = self.stack.pop().try_into().expect("offset too large");
+                let data = self.memory.mload(offset);
+                self.stack.push(data);
+            }
+            Opcode::MSTORE => {
+                let offset = self.stack.pop().try_into().expect("offset too large");
+                let data = self.stack.pop();
+                self.memory.mstore(offset, data);
+            }
             Opcode::JUMP => {
-                let dest = self.stack.pop().expect("Stack underflow") as usize;
+                let dest = self.stack.pop().try_into().expect("dest too large");
                 match self.code.get(dest) {
                     Some(&0x5B) => self.pc = dest,
                     _ => panic!("Invalid jump destination"),
                 }
             }
             Opcode::JUMPI => {
-                let cond = self.stack.pop().expect("Stack underflow");
-                let dest = self.stack.pop().expect("Stack underflow") as usize;
+                let cond = self.stack.pop();
+                let dest = self.stack.pop().try_into().expect("dest too large");
 
-                if cond != 0 {
+                if cond != U256::from(0) {
                     match self.code.get(dest) {
                         Some(&0x5B) => self.pc = dest,
                         _ => panic!("Invalid jump destination"),
@@ -52,34 +67,25 @@ impl Evm {
                 }
             }
             Opcode::JUMPDEST => {}
-            Opcode::PUSHn(value) => self.stack.push(value),
+            Opcode::PUSHn(n) => {
+                let bytes = &self.code[self.pc - n..self.pc];
+                self.stack.push(U256::from_be_slice(bytes));
+            }
             Opcode::DUPn(n) => {
-                let n = n as usize;
-                if let Some(&value) = self.stack.get(self.stack.len() - n) {
-                    self.stack.push(value);
-                    return;
-                }
-                panic!("Stack underflow");
+                let n = n.try_into().expect("dest too large");
+                self.stack.push(self.stack.peek(n));
             }
-            Opcode::SWAPn(n) => {
-                let n = n as usize;
-                let len = self.stack.len();
-                if n < len {
-                    self.stack.swap(len - 1, len - n - 1);
-                    return;
-                }
-                panic!("Stack underflow");
-            }
+            Opcode::SWAPn(n) => self.stack.swap(n.try_into().expect("dest too large")),
             Opcode::Unknown(byte) => panic!("Unknown opcode: {:?}", byte),
         }
     }
 
     fn bin_op<F>(&mut self, func: F)
     where
-        F: Fn(u128, u128) -> u128,
+        F: Fn(U256, U256) -> U256,
     {
-        let a = self.stack.pop().expect("Stack underflow");
-        let b = self.stack.pop().expect("Stack underflow");
+        let a = self.stack.pop();
+        let b = self.stack.pop();
         self.stack.push(func(b, a));
     }
 }
@@ -97,7 +103,11 @@ fn test_add() {
     let code: Vec<u8> = vec![0x60, 0x01, 0x60, 0x02, 0x01, 0x00];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![3]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(3));
+
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -105,7 +115,58 @@ fn test_mul() {
     let code: Vec<u8> = vec![0x60, 0x02, 0x60, 0x03, 0x02, 0x00];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![6]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(6));
+    assert_eq!(evm.stack, expected);
+}
+
+#[test]
+fn test_sub() {
+    let code: Vec<u8> = vec![0x60, 0x06, 0x60, 0x01, 0x03, 0x00];
+    let mut evm = Evm::new(code);
+    evm.run();
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(5));
+    assert_eq!(evm.stack, expected);
+}
+
+#[test]
+fn test_mstore_mload() {
+    let code: Vec<u8> = vec![
+        0x7f, // PUSH32
+        // 0x000000...000001 (U256::from(1))
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, // 32 bytes
+        0x60, 0x00, // PUSH1 0x00 - offset
+        0x52, // MSTORE
+        0x60, 0x00, // PUSH1 0x00 - offset
+        0x51, // MLOAD
+        0x00, // STOP
+    ];
+    let mut evm = Evm::new(code);
+    evm.run();
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(1));
+    assert_eq!(evm.stack, expected);
+}
+
+#[test]
+fn test_mload_uninitialized() {
+    let code: Vec<u8> = vec![
+        0x60, 0x40, // PUSH1 0x40
+        0x51, // MLOAD (memory[64])
+        0x00,
+    ];
+    let mut evm = Evm::new(code);
+    evm.run();
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(0));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -113,7 +174,12 @@ fn test_push() {
     let code: Vec<u8> = vec![0x60, 0x01, 0x61, 0x01, 0x00, 0x62, 0x01, 0x00, 0x00, 0x00];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![1, 256, 65536]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(1));
+    expected.push(U256::from(256));
+    expected.push(U256::from(65536));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -130,7 +196,10 @@ fn test_jump() {
     ];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![3]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(3));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -148,7 +217,11 @@ fn test_jumpi_false() {
     ];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![1, 11]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(1));
+    expected.push(U256::from(11));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -166,7 +239,10 @@ fn test_jumpi_true() {
     ];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![3]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(3));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -174,7 +250,13 @@ fn test_dup() {
     let code: Vec<u8> = vec![0x60, 0x01, 0x60, 0x02, 0x60, 0x03, 0x81, 0x00];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![1, 2, 3, 2]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(1));
+    expected.push(U256::from(2));
+    expected.push(U256::from(3));
+    expected.push(U256::from(2));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
@@ -182,7 +264,12 @@ fn test_swap() {
     let code: Vec<u8> = vec![0x60, 0x01, 0x60, 0x02, 0x60, 0x03, 0x91, 0x00];
     let mut evm = Evm::new(code);
     evm.run();
-    assert_eq!(evm.stack, Stack::from(vec![3, 2, 1]));
+
+    let mut expected = Stack::new();
+    expected.push(U256::from(3));
+    expected.push(U256::from(2));
+    expected.push(U256::from(1));
+    assert_eq!(evm.stack, expected);
 }
 
 #[test]
